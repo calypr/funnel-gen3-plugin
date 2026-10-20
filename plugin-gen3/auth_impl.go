@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -22,10 +21,6 @@ import (
 )
 
 type Authorize struct{}
-
-type AccessTokenResponse struct {
-	AccessToken string `json:"access_token"`
-}
 
 type StorageInfoResponse struct {
 	Bucket    string `json:"bucket"`
@@ -98,21 +93,11 @@ func (a Authorize) PluginAction(params map[string]string, headers map[string]*pr
 	}
 
 	// get the plugin configuration
-	// The OIDC client should be created in Gen3 with:
-	// `fence-create client-create --client CLIENT_NAME --grant-types client_credentials`
 	S3Url, ok := params["S3Url"]
 	if !ok || S3Url == "" {
 		return errorResponse(http.StatusBadRequest, "S3Url is required in params")
 	}
-	OidcClientId, ok := params["OidcClientId"]
-	if !ok || OidcClientId == "" {
-		return errorResponse(http.StatusBadRequest, "OidcClientId is required in params")
-	}
-	OidcClientSecret, ok := params["OidcClientSecret"]
-	if !ok || OidcClientSecret == "" {
-		return errorResponse(http.StatusBadRequest, "OidcClientSecret is required in params")
-	}
-	shared.Logger.Info("Configuration", "S3Url", S3Url, "OidcClientId", OidcClientId)
+	shared.Logger.Info("Configuration", "S3Url", S3Url)
 
 	// get the user's access token from the headers
 	authHeaders, ok := headers["authorization"]
@@ -127,9 +112,9 @@ func (a Authorize) PluginAction(params map[string]string, headers map[string]*pr
 	// validate the user's token and extract the user ID
 	userJWT := strings.TrimPrefix(authHeader, "Bearer ")
 	userJWT = strings.TrimPrefix(userJWT, "bearer ")
-	userId, err := validateTokenAndExtractUserId(userJWT)
+	_, err := validateTokenAndExtractUserId(userJWT)
 	if err != nil {
-		return errorResponse(http.StatusUnauthorized, fmt.Sprintf("unable to parse token: %w", err))
+		return errorResponse(http.StatusUnauthorized, fmt.Sprintf("unable to parse token: %v", err))
 	}
 
 	// get the S3 bucket and region for this user
@@ -137,12 +122,12 @@ func (a Authorize) PluginAction(params map[string]string, headers map[string]*pr
 	url := "http://gen3-workflow-service/storage/setup"
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("error creating HTTP request to '%s': %w", url, err))
+		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("error creating HTTP request to '%s': %v", url, err))
 	}
 	req.Header.Add("Authorization", "bearer "+userJWT)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("error making HTTP request to '%s': %w", url, err))
+		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("error making HTTP request to '%s': %v", url, err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -152,32 +137,9 @@ func (a Authorize) PluginAction(params map[string]string, headers map[string]*pr
 	storageInfoResponse := new(StorageInfoResponse)
 	err = json.NewDecoder(resp.Body).Decode(storageInfoResponse)
 	if err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("could not parse '%s' response body: %w", url, err))
+		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("could not parse '%s' response body: %v", url, err))
 	}
 	shared.Logger.Info("User's storage", "Bucket", storageInfoResponse.Bucket, "Region", storageInfoResponse.Region)
-
-	// exchange the OIDC client ID and secret for an access token
-	url = "http://fence-service/oauth2/token?grant_type=client_credentials&scope=openid%20user"
-	req, err = http.NewRequest("POST", url, nil)
-	if err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("error creating HTTP request to '%s': %w", url, err))
-	}
-	auth := base64.StdEncoding.EncodeToString([]byte(OidcClientId + ":" + OidcClientSecret))
-	req.Header.Add("Authorization", "Basic "+auth)
-	resp, err = httpClient.Do(req)
-	if err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("error making HTTP request to '%s': %w", url, err))
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return errorResponse(int64(resp.StatusCode), fmt.Sprintf("http error from '%s': status code %d, body: %s", url, resp.StatusCode, string(body)))
-	}
-	accessTokenResponse := new(AccessTokenResponse)
-	err = json.NewDecoder(resp.Body).Decode(accessTokenResponse)
-	if err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("could not parse '%s' response body: %w", url, err))
-	}
 
 	// generate and return the worker configuration
 	configuration.AmazonS3.Disabled = true
@@ -185,7 +147,9 @@ func (a Authorize) PluginAction(params map[string]string, headers map[string]*pr
 		{
 			Disabled: false,
 			Endpoint: S3Url,
-			Key:      accessTokenResponse.AccessToken + ";userId=" + userId,
+			// Gen3's S3 gateway validates the SigV4 access-key ID as the
+			// user's access token. Client tokens with a userId suffix are rejected.
+			Key:      userJWT,
 			Secret:   "N/A",
 			Bucket:   storageInfoResponse.Bucket,
 			Region:   storageInfoResponse.Region,
